@@ -22,6 +22,9 @@
     magStop: 1,       // стоп для такого сигнала, в ATR против входа
     magFar: 30,       // если StochRSI уже в крайней зоне по ходу сделки (шорт: K ≥ overbought), плотность может быть дальше: до N ATR
     guardEnter: true, // плотность за уровнем: не ждать возврата, а давать сигнал с лимиткой у её ближнего края (иначе только предупреждение)
+    sqN: 3,           // сильный сквиз: окно импульса, свечей
+    sqAtr: 3,         // ход за окно не меньше N ATR (ATR до импульса)
+    sqVol: 2,         // средний объём за окно не меньше N × среднего за 20 свечей до него
     evalMode: 'live'  // 'live' | 'close'
   };
 
@@ -323,6 +326,33 @@
     return res;
   }
 
+  // Сильный сквиз: резкий односторонний импульс за sqN свечей (≥ sqAtr ATR) на повышенном объёме (≥ sqVol × среднего за 20 свечей до него).
+  // Рост — сквиз шортов (up), падение — сквиз лонгов (down). Это информация, а не вход: возвращает событие только на первой свече, где условие выполнилось.
+  function squeeze(candles, ind, cfgIn) {
+    const cfg = Object.assign({}, DEFAULTS, cfgIn);
+    const i = evalIndex(candles, cfg.evalMode);
+    const N = Math.max(1, Math.round(cfg.sqN));
+    const at = (e) => {
+      const s = e - N + 1;
+      if (s < 21 || !candles[e]) return null;
+      const a = ind.atr[s - 1];
+      if (!Number.isFinite(a) || a <= 0) return null;
+      const mv = candles[e].close - candles[s].open;
+      if (Math.abs(mv) < cfg.sqAtr * a) return null;
+      let vs = 0, vb = 0;
+      for (let j = s; j <= e; j++) vs += candles[j].vol || 0;
+      for (let j = s - 20; j < s; j++) vb += candles[j].vol || 0;
+      vs /= N; vb /= 20;
+      if (!(vb > 0) || vs / vb < cfg.sqVol) return null;
+      return { dir: mv > 0 ? 'up' : 'down', move: mv, moveAtr: Math.abs(mv) / a, volX: vs / vb, from: candles[s].time, n: N };
+    };
+    const cur = i >= 0 ? at(i) : null;
+    if (!cur) return null;
+    const prev = at(i - 1);
+    if (prev && prev.dir === cur.dir) return null;      // импульс продолжается: уже сообщали
+    return Object.assign(cur, { time: candles[i].time, price: candles[i].close });
+  }
+
   // Какие сигналы новые. state = {active:Set, firedCandle:Map, firedEver:Set}
   function diffSignals(state, current) {
     const fresh = [];
@@ -343,5 +373,5 @@
     return fresh;
   }
 
-  return { DEFAULTS, rsi, sma, stochRsi, atr, compute, evalIndex, stochFlags, evaluate, diffSignals, zoneOf };
+  return { DEFAULTS, rsi, sma, stochRsi, atr, compute, evalIndex, stochFlags, evaluate, squeeze, diffSignals, zoneOf };
 });

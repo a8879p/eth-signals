@@ -26,7 +26,7 @@ const LS = {
   set(k, v) { try { localStorage.setItem('ethsig.' + k, JSON.stringify(v)); } catch (e) { /* приватный режим */ } }
 };
 const UI_DEFAULTS = { sound: true, vibrate: true, keepAwake: false, tf: '1h', liqOpacity: 0.9, flipAtr: 0.5,
-  diagTarget: 1, diagStop: 1, diagHorizon: 24, diagMinN: 15, diagSrc: 'auto', tgOn: false, tgToken: '', tgChat: '',
+  diagTarget: 1, diagStop: 1, diagHorizon: 24, diagMinN: 15, diagSrc: 'auto', tgOn: false, tgToken: '', tgChat: '', tgLiq: true, tgStoch: true, tgSq: true, tgOther: false, tgKHi: 90, tgKLo: 20,
   autoOn: true, autoSig: false, autoWin: 5, autoTol: 0.6, autoMax: 8,
   learnOn: false, learnRev: 1.5, learnStop: 1, learnWin: 3, learnBounce: 1, learnBreak: 0.5, learnProx: 0.5, learnH: 24, learnCtl: 8, learnSrc: 'hist', learnEv: 'all' };
 let settings = Object.assign({}, Core.DEFAULTS, UI_DEFAULTS, LS.get('settings', {}));
@@ -930,7 +930,7 @@ function updateTrades() {
     if (!res) return;
     Object.assign(tr, res, { at: Date.now() });
     changed = true;
-    tgSend('Сделка завершена · ETH ' + TF[tr.tf].label + '\n' + (long ? 'ЛОНГ' : 'ШОРТ') + ': ' + tradeHtml(tr, '').replace(/<[^>]+>/g, ''));
+    if (tr.tg) tgSend('Сделка завершена · ETH ' + TF[tr.tf].label + '\n' + (long ? 'ЛОНГ' : 'ШОРТ') + ': ' + tradeHtml(tr, '').replace(/<[^>]+>/g, ''));   // только по тем сделкам, о входе в которые писали
     toast('<b>Сделка завершена · ' + TF[tr.tf].label + '</b><br>' + (long ? 'ЛОНГ' : 'ШОРТ') + ': ' + tradeHtml(tr, '').replace(/<[^>]+>/g, ''));
   });
   if (changed) saveTrades();
@@ -965,12 +965,13 @@ function evaluateAll() {
   if (tk.changed) {
     LS.set('levels', levels);
     if (tk.newly.length || levels.some(isPartial)) { renderLines(); updateMarkers(); }
-    tk.newly.forEach(l => { const z = Core.zoneOf(l); toast('<b>Плотность снята</b><br>' + (l.side === 'above' ? 'выше цены ' : 'ниже цены ') + lvlPriceTxt(l) + ': цена дошла до неё. На графике она заканчивается на этой свече, в расчётах больше не участвует.' + (l.src === 'img' ? '<br><b>Обновите плотности из скриншота.</b>' : '')); });
+    tk.newly.forEach(l => { tgTaken(l); const z = Core.zoneOf(l); toast('<b>Плотность снята</b><br>' + (l.side === 'above' ? 'выше цены ' : 'ниже цены ') + lvlPriceTxt(l) + ': цена дошла до неё. На графике она заканчивается на этой свече, в расчётах больше не участвует.' + (l.src === 'img' ? '<br><b>Обновите плотности из скриншота.</b>' : '')); });
   }
   updateTrades();
   const eff = effLevels();
   const all = [];
   const newOnes = [];
+  const silent = new Set();   // ТФ, у которых это первый проход: Telegram и сквизы молчат
   for (const t of TFS) {
     const d = data[t.id];
     if (!d || !d.ind) continue;
@@ -989,10 +990,11 @@ function evaluateAll() {
       sigs = sigs.filter(x => x.kind !== 'signal' || x.stateKey === fresh[0].stateKey);
     }
     all.push.apply(all, sigs);
-    if (!first) seeded.add(t.id);   // первый проход — молча, чтобы не сыпать старыми сигналами при открытии
+    if (!first) { seeded.add(t.id); silent.add(t.id); }   // первый проход — молча, чтобы не сыпать старыми сигналами при открытии
     else newOnes.push.apply(newOnes, fresh);
   }
   if (newOnes.length) notifyFresh(newOnes);
+  try { tgScan(all, silent); sqScan(silent); } catch (e) { console.error('Telegram:', e); }
   activeSignals = all;
   if (newOnes.length) { try { diagRecordFresh(newOnes); } catch (e) { console.error('диагностика:', e); } }   // сбой диагностики не должен ломать сигналы
   refreshLiveMarkers();
@@ -1011,7 +1013,6 @@ function notifyFresh(list) {
   const tfs = list.map(s => TF[s.tf].label).join(', ');
   toast('<b>' + DIR_NAME[first.dir] + ' · ' + (list.length > 1 ? tfs : TF[first.tf].label) + '</b><br>' + esc(first.text) +
     (list.length > 1 ? '<br><span class="muted">и ещё сигналов: ' + (list.length - 1) + '</span>' : ''), first.dir);
-  tgNotify(list);
   if (settings.sound) beep(first.dir);
   if (settings.vibrate && navigator.vibrate) navigator.vibrate([200, 100, 200]);
   if (document.hidden) osNotify(DIR_NAME[first.dir] + ' ETH · ' + tfs, first.text, first.stateKey);
@@ -1099,16 +1100,68 @@ async function tgSend(text, force) {
     return false;
   }
 }
-function tgNotify(list) {
-  if (!settings.tgOn) return;
-  const tfs = list.map(s => TF[s.tf].label).join(', ');
-  list.forEach(s => {
+// Что уходит в Telegram: снос плотности (снята + вынос с возвратом), сигнал у линии при K ≥ tgKHi (шорт) / ≤ tgKLo (лонг), сильные сквизы.
+// Остальные сигналы (в том числе «к плотности») остаются в приложении; их можно включить переключателем «Остальные».
+const tgSent = new Set(), tgOnce = new Set(), tgSq = new Set();   // что уже отправлено (для «один раз» и сквизов — навсегда, для остальных — пока сигнал активен)
+const capSet = (s, n) => { while (s.size > n) s.delete(s.values().next().value); };
+function tgPass(s) {
+  if (s.kind !== 'signal') return false;
+  let ok = false;
+  if (s.sub === 'mag') ok = false;
+  else if (s.levelType === 'liq') ok = !!settings.tgLiq;
+  else if (s.levelType === 'support' || s.levelType === 'resistance') ok = !!settings.tgStoch && (s.dir === 'short' ? s.k >= settings.tgKHi : s.k <= settings.tgKLo);
+  return ok || !!settings.tgOther;
+}
+function tgScan(all, silent) {
+  const sigs = all.filter(s => s.kind === 'signal');
+  const alive = new Set(sigs.map(s => s.stateKey));
+  tgSent.forEach(k => { if (!alive.has(k)) tgSent.delete(k); });   // сигнал погас: при повторе отправим снова
+  const out = [];
+  sigs.forEach(s => {
+    if (!tgPass(s)) return;
+    const set = s.once ? tgOnce : tgSent;
+    if (set.has(s.stateKey)) return;
+    set.add(s.stateKey);
+    if (!silent.has(s.tf)) out.push(s);
+  });
+  capSet(tgOnce, 500);
+  if (!out.length || !settings.tgOn) return;
+  const tfs = out.map(s => TF[s.tf].label).join(', ');
+  out.forEach(s => {
+    const tr = tradeFor(s);
+    if (tr && !tr.tg) { tr.tg = true; saveTrades(); }
     const L = s.dir === 'long';
     let t = (L ? '🟢 ЛОНГ' : '🔴 ШОРТ') + ' ETH · ' + TF[s.tf].label + '\n' + s.text + '\nЦена ' + fmtP(s.price);
+    if (Number.isFinite(s.limitPrice)) t += ' · лимитка ' + fmtP(s.limitPrice);
     if (Number.isFinite(s.exitPrice)) t += ' · выход ' + fmtP(s.exitPrice);
     t += !L && Number.isFinite(s.stopPrice) ? ' · стоп ' + fmtP(s.stopPrice) : ' · без стопа';
-    if (list.length > 1) t += '\nОдновременно на ТФ: ' + tfs;
+    if (out.length > 1) t += '\nОдновременно на ТФ: ' + tfs;
     tgSend(t);
+  });
+}
+// плотность снята только что (свежее часа: при открытии приложения старые не пересказываем)
+function tgTaken(l) {
+  if (!settings.tgOn || !settings.tgLiq || !l.takenAt || Date.now() / 1000 - l.takenAt > 3600) return;
+  tgSend('🧲 СНОС ПЛОТНОСТИ ETH\n' + (l.side === 'above' ? 'Плотность выше ' : 'Плотность ниже ') + lvlPriceTxt(l) + (l.volume ? ' ($' + l.volume + 'M)' : '') + ' снята: цена дошла до дальнего края. Цена ' + fmtP(lastPrice));
+}
+// сильный сквиз: импульс на объёме (информация, не вход); уведомляем один раз на свечу
+function sqScan(silent) {
+  if (!settings.tgSq) return;
+  TFS.forEach(t => {
+    const d = data[t.id];
+    if (!d || !d.ind) return;
+    const q = Core.squeeze(d.candles, d.ind, settings);
+    if (!q) return;
+    const key = t.id + '|' + q.dir + '|' + q.time;
+    if (tgSq.has(key)) return;
+    tgSq.add(key); capSet(tgSq, 300);
+    if (silent.has(t.id)) return;
+    const up = q.dir === 'up';
+    const swept = levels.filter(l => l.type === 'liq' && l.takenAt && l.takenAt >= q.from).map(l => lvlPriceTxt(l, true));
+    const head = (up ? 'СКВИЗ ШОРТОВ ▲' : 'СКВИЗ ЛОНГОВ ▼') + ' · ' + TF[t.id].label;
+    const body = (up ? '+' : '−') + Math.abs(q.move).toFixed(1) + '$ (' + q.moveAtr.toFixed(1) + ' ATR) за ' + q.n + ' св., объём ×' + q.volX.toFixed(1) + ' от среднего' + (swept.length ? ', снесена плотность ' + swept.join(', ') : '') + '. Цена ' + fmtP(q.price);
+    toast('<b>' + head + '</b><br>' + esc(body), up ? 'long' : 'short');
+    if (settings.tgOn) tgSend('⚡ ' + head.replace(' · ', ' ETH · ') + '\n' + body);
   });
 }
 async function tgTest() {
@@ -1322,6 +1375,11 @@ function viewSettings() {
     '<label class="f">Когда проверять условия<select data-set="evalMode"><option value="live"' + (settings.evalMode === 'live' ? ' selected' : '') + '>По текущей цене (быстро)</option><option value="close"' + (settings.evalMode === 'close' ? ' selected' : '') + '>По закрытию свечи (надёжнее)</option></select></label>' +
     '<h3>Telegram</h3>' + swField('tgOn', 'Слать сигналы в Telegram') + textField('tgToken', 'Токен бота (от @BotFather)', 'password') + textField('tgChat', 'Chat ID') +
     '<div class="row" style="margin-top:8px"><button class="btn" data-act="tgTest">Отправить тест</button></div>' +
+    '<h3>Что слать в Telegram</h3>' + swField('tgLiq', 'Снос плотности (снята + вынос с возвратом)') + swField('tgStoch', 'Сигнал у линии при крайнем StochRSI') +
+    '<div class="grid2">' + numField('tgKHi', 'Шорт: K не ниже') + numField('tgKLo', 'Лонг: K не выше') + '</div>' +
+    swField('tgSq', 'Сильные сквизы (импульс на объёме)') + '<div class="grid2">' + numField('sqAtr', 'Сквиз: ход, ATR', 0.5) + numField('sqN', 'за свечей') + numField('sqVol', 'Объём, × от среднего', 0.5) + '</div>' +
+    swField('tgOther', 'Остальные сигналы (к плотности и прочие)') +
+    '<div class="muted small">Остальные сигналы остаются в приложении. Сквиз — информация, не вход: рост на объёме = сквиз шортов, падение = сквиз лонгов. Сделка завершается в Telegram только если о её входе писали.</div>' +
     '<div class="muted small" style="margin-top:6px">Токен хранится только на этом устройстве. Сообщения идут, пока приложение открыто; если открыть его на двух устройствах с включённой отправкой, придут дубли.</div>' +
     '<h3>Оповещения</h3>' + swField('sound', 'Звук') + swField('vibrate', 'Вибрация (Android)') + swField('keepAwake', 'Не гасить экран') +
     '<div class="sw"><span>Системные уведомления<br><span class="muted small">' + (perm === 'granted' ? 'включены' : perm === 'denied' ? 'запрещены в браузере' : perm === 'unsupported' ? 'не поддерживаются' : 'выключены') + '</span></span>' +
@@ -1677,6 +1735,7 @@ function viewLearn() {
 const RULES = {
   rsiLen: [2, 100, 1], stochLen: [2, 100, 1], kLen: [1, 20, 1], dLen: [1, 20, 1], overbought: [50, 99, 0], oversold: [1, 50, 0],
   liqOpacity: [0.1, 1, 0], proxAtr: [0.05, 5, 0], depthAtr: [0.1, 5, 0], guardAtr: [0, 10, 0], sweepWindow: [1, 30, 1], flipAtr: [0, 5, 0], magMax: [0.5, 10, 0], magStop: [0.2, 5, 0], magFar: [3, 100, 0],
+  tgKHi: [50, 99, 0], tgKLo: [1, 50, 0], sqAtr: [1, 20, 0], sqN: [1, 10, 1], sqVol: [1, 20, 0],
   diagTarget: [0.2, 10, 0], diagStop: [0.2, 10, 0], diagHorizon: [1, 48, 1], diagMinN: [5, 200, 1],
   autoWin: [2, 15, 1], autoTol: [0.2, 3, 0], autoMax: [2, 16, 1],
   learnRev: [0.5, 10, 0], learnStop: [0.3, 5, 0], learnWin: [1, 10, 1], learnBounce: [0.3, 5, 0], learnBreak: [0.2, 3, 0], learnProx: [0.1, 2, 0], learnH: [4, 48, 1], learnCtl: [2, 50, 1]

@@ -1,5 +1,5 @@
 /* Service worker: оболочка приложения работает офлайн, данные рынка всегда идут напрямую с Binance */
-const CACHE = 'eth-signals-v15';
+const CACHE = 'eth-signals-v16';
 const SHELL = [
   './', 'index.html', 'app.js', 'core.js', 'diag.js', 'learn.js', 'auto.js', 'heat.js', 'lightweight-charts.js',
   'manifest.webmanifest', 'icon.svg', 'icon-192.png', 'icon-512.png', 'icon-maskable-512.png'

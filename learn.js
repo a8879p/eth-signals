@@ -282,5 +282,13 @@
       'Ответ: короткий список правил «если …, то …» с числом событий и долей win, отдельно что не подтвердилось. Без обещаний прибыли. Если нужны полные записи, скажи, какой срез выгрузить.';
   }
 
-  return { DEFAULTS, FACTORS, HTF, RULES_TEXT, collect, summarize, freq, digest, exportJson, toCsv, prompt };
+  // Условия на свече i для заданного направления (для журнала сделок): те же признаки, что у событий «Обучения».
+  // o: {levels:[{price, auto?}], liqs, htf, prox}
+  function featuresAt(tf, candles, ind, i, dir, o) {
+    o = o || {};
+    const b = { ctx: Diag.prepare(candles), levels: o.levels || [], liqs: o.liqs || null, htf: o.htf || null, prox: o.prox || 0.5 };
+    return feats(tf, candles, ind, i, dir, b);
+  }
+
+  return { DEFAULTS, FACTORS, HTF, RULES_TEXT, collect, featuresAt, summarize, freq, digest, exportJson, toCsv, prompt };
 });

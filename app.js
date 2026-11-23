@@ -27,6 +27,7 @@ const LS = {
 };
 const UI_DEFAULTS = { sound: true, vibrate: true, keepAwake: false, tf: '1h', liqOpacity: 0.9, flipAtr: 0.5,
   diagTarget: 1, diagStop: 1, diagHorizon: 24, diagMinN: 15, diagSrc: 'auto', tgOn: false, tgToken: '', tgChat: '', tgLiq: true, tgStoch: true, tgSq: true, tgOther: false, tgKHi: 90, tgKLo: 20,
+  paperMargin: 100, paperLev: 3, paperStopAtr: 1, paperFeeT: 0.05, paperFeeM: 0.02,
   autoOn: true, autoSig: false, autoWin: 5, autoTol: 0.6, autoMax: 8,
   learnOn: false, learnRev: 1.5, learnStop: 1, learnWin: 3, learnBounce: 1, learnBreak: 0.5, learnProx: 0.5, learnH: 24, learnCtl: 8, learnSrc: 'hist', learnEv: 'all' };
 let settings = Object.assign({}, Core.DEFAULTS, UI_DEFAULTS, LS.get('settings', {}));
@@ -628,6 +629,7 @@ function renderLines() {
   $('#lineCount').textContent = levels.filter(l => !isTaken(l)).length;
   if (zones) zones.update();
   renderAutoLines();
+  renderPaperLines(true);
 }
 // перекрасить линии уровней (роль сменилась), не пересоздавая их
 function restyleLines() {
@@ -657,6 +659,15 @@ function hitLevel(clientY) {
   const rect = $('#priceChart').getBoundingClientRect();
   const y = clientY - rect.top;
   let best = null, bd = 18;
+  for (const t of paperLive()) {            // линии виртуальных сделок: лимитка, стоп, цель
+    for (const fld of (t.st === 'pending' ? ['limit', 'stop', 'target'] : ['stop', 'target'])) {
+      if (!t[fld]) continue;
+      const ly = candleSeries.priceToCoordinate(t[fld]);
+      if (ly == null) continue;
+      const dd = Math.abs(ly - y);
+      if (dd < bd) { bd = dd; best = { l: null, paper: t, field: fld, part: 'p' }; }
+    }
+  }
   for (const l of levels) {
     if (isTaken(l)) continue;
     const sz = shownZone(l);
@@ -700,8 +711,8 @@ function bindDrag() {
     e.stopPropagation();
     if (e.cancelable) e.preventDefault();
     const sy = pointY(e);
-    drag = { l: hit.l, part: hit.part, auto: !!hit.auto, moved: false, startY: sy,
-      startPrice: candleSeries.coordinateToPrice(sy - el.getBoundingClientRect().top), orig: { price: hit.l.price, price2: hit.l.price2 } };
+    drag = { l: hit.l, paper: hit.paper, field: hit.field, part: hit.part, auto: !!hit.auto, moved: false, startY: sy,
+      startPrice: candleSeries.coordinateToPrice(sy - el.getBoundingClientRect().top), orig: hit.l ? { price: hit.l.price, price2: hit.l.price2 } : {} };
     window.addEventListener('mousemove', move, true);
     window.addEventListener('mouseup', up, true);
     window.addEventListener('touchmove', move, { capture: true, passive: false });
@@ -717,6 +728,7 @@ function bindDrag() {
     if (!drag.moved) return;
     const price = candleSeries.coordinateToPrice(y - el.getBoundingClientRect().top);
     if (price == null || price <= 0) return;
+    if (drag.paper) { paperDragTo(drag.paper, drag.field, round2(price)); return; }
     if (drag.auto) {                         // автоуровень сдвинули: он становится обычной линией, а на старом месте больше не рисуется
       const a0 = drag.l, nl = { id: uid(), type: 'sr', price: a0.price };
       levels.push(nl);
@@ -749,6 +761,7 @@ function bindDrag() {
     window.removeEventListener('touchend', up, true);
     window.removeEventListener('touchcancel', up, true);
     const d = drag; drag = null;
+    if (d.paper) { if (d.moved) paperDragEnd(d.paper); else setTab('paper'); return; }
     if (d.moved) { saveLevels(); evaluateAll(); renderPanel(); }
     else if (d.auto) toast('Автоуровень: потяните его, чтобы закрепить как свою линию');
     else openLevelModal(d.l);
@@ -968,6 +981,7 @@ function evaluateAll() {
     tk.newly.forEach(l => { tgTaken(l); const z = Core.zoneOf(l); toast('<b>Плотность снята</b><br>' + (l.side === 'above' ? 'выше цены ' : 'ниже цены ') + lvlPriceTxt(l) + ': цена дошла до неё. На графике она заканчивается на этой свече, в расчётах больше не участвует.' + (l.src === 'img' ? '<br><b>Обновите плотности из скриншота.</b>' : '')); });
   }
   updateTrades();
+  try { paperUpdate(); } catch (e) { console.error('сделки:', e); }
   const eff = effLevels();
   const all = [];
   const newOnes = [];
@@ -1233,7 +1247,7 @@ function renderPanel(force) {
   if (!tab) return;
   if (tab === 'settings' && !force) return;
   if (!force && Date.now() < panelBusyUntil) return;
-  const html = tab === 'signals' ? viewSignals() : tab === 'lines' ? viewLines() : tab === 'diag' ? viewDiag() : tab === 'learn' ? viewLearn() : viewSettings();
+  const html = tab === 'signals' ? viewSignals() : tab === 'lines' ? viewLines() : tab === 'diag' ? viewDiag() : tab === 'learn' ? viewLearn() : tab === 'paper' ? viewPaper() : viewSettings();
   if (html === lastPanelHtml && !force) return;
   lastPanelHtml = html;
   const panel = $('#panel');
@@ -1271,7 +1285,7 @@ function viewSignals() {
     const n = s.kind === 'signal' ? conf[s.dir].size : 0;
     h += '<div class="card ' + c + '"><div class="top"><span class="badge ' + c + '">' + (s.kind === 'signal' ? DIR_NAME[s.dir] : 'ВНИМАНИЕ') + '</span><b>' + TF[s.tf].label + '</b>' +
       (n > 1 ? '<span class="badge">×' + n + ' ТФ</span>' : '') + '<span class="muted small right">K ' + fmtK(s.k) + '</span></div><div class="small">' + esc(s.text) + '</div>' +
-      (s.kind === 'signal' ? '<div class="small muted">' + sigTimeTxt(s) + sigStatusHtml(s) + '</div>' : '') + '</div>';
+      (s.kind === 'signal' ? '<div class="small muted">' + sigTimeTxt(s) + sigStatusHtml(s) + '</div><button class="btn" data-act="payFromSig" data-sk="' + esc(s.stateKey) + '" data-tf="' + s.tf + '" style="margin-top:6px;padding:5px 10px">⚡ Войти в сделку</button>' : '') + '</div>';
   });
   h += '<h3>Таймфреймы</h3><table><tr><th>ТФ<th>K<th>D<th>Ближайший уровень<th></tr>';
   TFS.forEach(t => {
@@ -1371,6 +1385,9 @@ function viewSettings() {
     numField('learnBounce', 'Подход: отбой, ATR', 0.1) + numField('learnBreak', 'Подход: пробой, ATR', 0.1) +
     numField('learnProx', 'Подход: зона у линии, ATR', 0.1) + numField('learnH', 'Горизонт, свечей (до 48)') + '</div>' +
     '<div class="muted small">Влияет только на вкладку «Обучение». Изменение пересчитывает историю; уже собранные живые события хранят свои цель и стоп.</div>' +
+    '<h3>Виртуальные сделки</h3><div class="grid2">' + numField('paperMargin', 'Маржа по умолчанию, $') + numField('paperLev', 'Плечо по умолчанию (1–10)') + numField('paperStopAtr', 'Стоп по умолчанию, ATR', 0.1) +
+    numField('paperFeeT', 'Комиссия по рынку, %', 0.01) + numField('paperFeeM', 'Комиссия лимитки, %', 0.01) + '</div>' +
+    '<div class="muted small">Сделки виртуальные: на биржу ничего не уходит. Цена ликвидации считается упрощённо (изолированная маржа, поддерживающая 0.4%).</div>' +
     '<h3>Вид</h3>' + numField('liqOpacity', 'Прозрачность линии плотности (0.1–1)', 0.05) +
     '<label class="f">Когда проверять условия<select data-set="evalMode"><option value="live"' + (settings.evalMode === 'live' ? ' selected' : '') + '>По текущей цене (быстро)</option><option value="close"' + (settings.evalMode === 'close' ? ' selected' : '') + '>По закрытию свечи (надёжнее)</option></select></label>' +
     '<h3>Telegram</h3>' + swField('tgOn', 'Слать сигналы в Telegram') + textField('tgToken', 'Токен бота (от @BotFather)', 'password') + textField('tgChat', 'Chat ID') +
@@ -1544,6 +1561,400 @@ function learnCopyPrompt() {
   const save = () => downloadText('eth-learn-prompt-' + diagFileStamp() + '.txt', txt, 'text/plain;charset=utf-8');
   if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(() => toast('Сводка скопирована (' + Math.round(txt.length / 1000) + ' тыс. символов): вставьте в чат с ИИ'), save);
   else save();
+}
+
+// ---------- виртуальные сделки ----------
+// Бумажная торговля внутри приложения: на биржу ничего не отправляется. Исполнение по свечам 15м и живой цене.
+// Если в одной свече и стоп (ликвидация), и цель — считается стоп. На свече заполнения лимитки цель не проверяется.
+const PAPER_MMR = 0.004;                       // поддерживающая маржа для цены ликвидации (изолированная маржа, упрощённо)
+let paper = LS.get('paper', []) || [];
+const savePaper = () => { if (paper.length > 500) paper = paper.slice(-500); LS.set('paper', paper); };
+const pSign = (t) => t.dir === 'long' ? 1 : -1;
+const paperLive = () => paper.filter(t => t.st === 'pending' || t.st === 'open');
+const feeRate = (maker) => (maker ? +settings.paperFeeM : +settings.paperFeeT) / 100;
+const liqPrice = (dir, e, lev) => dir === 'long' ? e * (1 - 1 / lev + PAPER_MMR) : e * (1 + 1 / lev - PAPER_MMR);
+const money = (x) => (x >= 0 ? '+' : '−') + '$' + Math.abs(x).toFixed(2);
+const PAPER_WHY = { stop: 'стоп', target: 'цель', liq: 'ликвидация', manual: 'закрыта вручную', expired: 'срок лимитки вышел', cancel: 'отменена' };
+const dirTag = (t) => (t.dir === 'long' ? '▲ ЛОНГ ' : '▼ ШОРТ ') + t.lev + '×';
+
+// условия на последней закрытой свече выбранного ТФ: те же признаки, что у событий «Обучения»
+function paperConditions(tf, dir) {
+  const d = data[tf];
+  if (!d || !d.ind) return null;
+  const n = d.candles.length, i = d.candles[n - 1].closed === false ? n - 2 : n - 1;
+  if (i < 30) return null;
+  const out = { k: Math.round(d.ind.k[i] * 10) / 10, d: Math.round(d.ind.d[i] * 10) / 10, atr: round2(d.ind.atr[i]), at: d.candles[i].time, f: null };
+  if (HAS_LEARN && Learn.featuresAt) {
+    const lv = levels.filter(l => l.type === 'sr').concat(settings.autoOn ? autoLevels.map(l => Object.assign({}, l, { auto: true })) : []);
+    const liqs = levels.filter(l => l.type === 'liq' && !l.takenAt);
+    try { out.f = Learn.featuresAt(tf, d.candles, d.ind, i, dir, { levels: lv, liqs, htf: learnHtf(tf), prox: 0.5 }); } catch (e) { console.error('условия сделки:', e); }
+  }
+  return out;
+}
+function paperFill(tr, price, tms, maker) {
+  tr.st = 'open'; tr.entry = round2(price); tr.tIn = tms; tr.qty = tr.margin * tr.lev / tr.entry;
+  tr.liq = round2(liqPrice(tr.dir, tr.entry, tr.lev)); tr.feeIn = tr.margin * tr.lev * feeRate(maker); tr.maker = !!maker; tr.stop0 = tr.stop;
+  toast('<b>Сделка открыта · ' + dirTag(tr) + '</b><br>вход ' + fmtP(tr.entry) + (tr.stop ? ' · стоп ' + fmtP(tr.stop) : ' · без стопа') + ' · ликвидация ' + fmtP(tr.liq), tr.dir);
+}
+function paperClose(tr, price, why, tms) {
+  const p = round2(price), feeOut = p * tr.qty * feeRate(why === 'target');
+  tr.exitP = p; tr.tOut = tms; tr.why = why; tr.st = 'closed';
+  tr.fees = round2(tr.feeIn + feeOut);
+  tr.pnl = round2(why === 'liq' ? -tr.margin : pSign(tr) * (p - tr.entry) * tr.qty - tr.feeIn - feeOut);
+  tr.pnlPct = round2(tr.pnl / tr.margin * 100);
+  tr.r = tr.stop0 ? round2(pSign(tr) * (p - tr.entry) / Math.abs(tr.entry - tr.stop0)) : null;   // R по цене, по начальному стопу, без комиссий
+  toast('<b>Сделка закрыта · ' + dirTag(tr) + '</b><br>' + PAPER_WHY[why] + ' · ' + fmtP(tr.entry) + ' → ' + fmtP(p) + ' · <b>' + money(tr.pnl) + '</b> (' + tr.pnlPct.toFixed(1) + '% маржи)', tr.pnl >= 0 ? 'long' : 'short');
+}
+function paperUpdate() {
+  const live = paperLive(), pt = priceTf(), dp = pt && data[pt], now = Date.now();
+  let changed = false;
+  if (dp && live.length) {
+    const cs = dp.candles, sec = TF[pt].sec;
+    live.forEach(tr => {
+      if (lastPrice != null) { if (lastPrice > tr.pmax) tr.pmax = lastPrice; if (lastPrice < tr.pmin) tr.pmin = lastPrice; }
+      const from = tr.seen ? tr.seen + sec : tr.cT, long = tr.dir === 'long';
+      let j = cs.length - 1;
+      while (j > 0 && cs[j - 1].time >= from) j--;
+      for (; j < cs.length && (tr.st === 'pending' || tr.st === 'open'); j++) {
+        const c = cs[j];
+        if (c.time < from) continue;
+        let hi = c.high, lo = c.low;
+        if (c.time === tr.cT && tr.s0) {   // свеча, в которой создали сделку: до создания цена там уже была, считаем только новые экстремумы и сэмплы живой цены
+          hi = Math.max(c.high > tr.s0[0] ? c.high : -Infinity, tr.pmax); lo = Math.min(c.low < tr.s0[1] ? c.low : Infinity, tr.pmin);
+        }
+        const tMs = c.closed === false ? now : (c.time + sec) * 1000;
+        let filledNow = false;
+        if (tr.st === 'pending') {
+          if (tr.exp && now >= tr.exp && c.closed === false) { tr.st = 'cancelled'; tr.why = 'expired'; tr.tOut = tr.exp; changed = true; break; }
+          if (long ? lo <= tr.limit : hi >= tr.limit) { paperFill(tr, tr.limit, tMs, true); filledNow = true; changed = true; }
+        }
+        if (tr.st === 'open') {
+          const adv = long ? Math.max(tr.stop || -Infinity, tr.liq) : Math.min(tr.stop || Infinity, tr.liq);
+          if (long ? lo <= adv : hi >= adv) { paperClose(tr, adv, adv === tr.liq ? 'liq' : 'stop', tMs); changed = true; }
+          else if (!filledNow && tr.target && (long ? hi >= tr.target : lo <= tr.target)) { paperClose(tr, tr.target, 'target', tMs); changed = true; }
+        }
+        if (c.closed !== false && (tr.st === 'pending' || tr.st === 'open')) tr.seen = c.time;
+      }
+      if (tr.st === 'pending' && tr.exp && now >= tr.exp) { tr.st = 'cancelled'; tr.why = 'expired'; tr.tOut = tr.exp; changed = true; }
+    });
+  }
+  if (changed) { savePaper(); renderPaperLines(true); }
+  const n = paperLive().length, b = $('#payCount');
+  if (b) { b.textContent = n; b.className = n ? 'hot' : ''; }
+  return changed;
+}
+
+let paperLineObjs = [], paperLineKey = '';
+function renderPaperLines(force) {
+  if (!candleSeries) return;
+  const live = paperLive();
+  const key = JSON.stringify(live.map(t => [t.id, t.st, t.limit, t.entry, t.stop, t.target, t.liq]));
+  if (!force && key === paperLineKey) return;
+  paperLineKey = key;
+  paperLineObjs.forEach(h => { try { candleSeries.removePriceLine(h); } catch (e) { /* линия уже убрана */ } });
+  paperLineObjs = [];
+  const mk = (price, color, title, style) => paperLineObjs.push(candleSeries.createPriceLine({ price, color, lineWidth: 1, lineStyle: style, axisLabelVisible: true, title }));
+  live.forEach(t => {
+    const tag = (t.dir === 'long' ? '▲' : '▼') + t.lev + '×';
+    if (t.st === 'pending') mk(t.limit, '#4da3ff', 'ЛИМИТ ' + tag, 2); else mk(t.entry, '#4da3ff', 'ВХОД ' + tag, 0);
+    if (t.stop) mk(t.stop, '#ff5b5b', 'СТОП', 2);
+    if (t.target) mk(t.target, '#2ecc71', 'ЦЕЛЬ', 2);
+    if (t.st === 'open') mk(t.liq, '#f5a623', 'ЛИКВИДАЦИЯ', 1);
+  });
+}
+// перетаскивание линии сделки (режим «Правка»): стоп и цель должны оставаться по свою сторону от входа
+function paperDragTo(tr, f, p) {
+  const long = tr.dir === 'long', ref = tr.st === 'open' ? tr.entry : (tr.limit || lastPrice);
+  const ok = f === 'limit' ? p > 0 : f === 'stop' ? (long ? p < ref : p > ref) : (long ? p > ref : p < ref);
+  if (!ok) return;
+  tr[f] = p; renderPaperLines(true);
+}
+function paperDragEnd(tr) {
+  if (tr.st === 'pending' && lastPrice != null && (tr.dir === 'long' ? tr.limit >= lastPrice : tr.limit <= lastPrice)) paperFill(tr, lastPrice, Date.now(), false);   // лимитку перетащили за рынок: исполняется сразу
+  savePaper(); renderPaperLines(true); paperUpdate(); renderPanel(true);
+}
+function paperSetField(tr, f, v) {
+  const long = tr.dir === 'long', ref = tr.st === 'open' ? tr.entry : (tr.limit || lastPrice);
+  if (v === null) { tr[f] = null; }
+  else if (!(v > 0) || (f === 'stop' ? (long ? v >= ref : v <= ref) : (long ? v <= ref : v >= ref))) { toast(f === 'stop' ? 'Стоп должен быть ' + (long ? 'ниже' : 'выше') + ' входа' : 'Цель должна быть ' + (long ? 'выше' : 'ниже') + ' входа'); return; }
+  else tr[f] = round2(v);
+  savePaper(); renderPaperLines(true); renderPanel(true);
+}
+
+function paperCreate(o) {
+  if (lastPrice == null) { toast('Нет цены: дождитесь загрузки'); return null; }
+  const dp = data[priceTf()], c0 = dp ? dp.candles[dp.candles.length - 1] : null, long = o.dir === 'long', market = o.type === 'market';
+  const imm = market || (long ? o.limit >= lastPrice : o.limit <= lastPrice);   // лимитка по цене не хуже рынка исполняется сразу, как рыночная
+  const tr = { id: uid(), st: 'pending', dir: o.dir, tf: o.tf, type: o.type, limit: market ? null : o.limit, lev: o.lev, margin: o.margin, stop: o.stop || null, target: o.target || null,
+    t0: Date.now(), exp: !market && o.hours > 0 ? Date.now() + o.hours * 3600000 : null, cT: c0 ? c0.time : 0, s0: c0 ? [c0.high, c0.low] : null, pmax: lastPrice, pmin: lastPrice, seen: 0,
+    src: o.src || 'manual', sig: o.sig || '', cond: paperConditions(o.tf, o.dir),
+    sigs: activeSignals.filter(x => x.tf === o.tf).map(x => (x.kind === 'signal' ? DIR_NAME[x.dir] : 'ВНИМАНИЕ') + ': ' + x.text) };
+  if (tr.cond && tr.limit) tr.offAtr = round2(Math.abs(lastPrice - tr.limit) / tr.cond.atr);
+  paper.push(tr);
+  if (imm) paperFill(tr, lastPrice, Date.now(), false);
+  else toast('<b>Лимитка выставлена · ' + dirTag(tr) + '</b><br>' + fmtP(tr.limit) + (tr.exp ? ' · живёт до ' + fmtStamp(tr.exp) : ' · пока не отмените'), tr.dir);
+  savePaper(); renderPaperLines(true); paperUpdate(); renderPanel(true);
+  return tr;
+}
+function paperCloseNow(id) {
+  const tr = paper.find(t => t.id === id);
+  if (!tr || lastPrice == null) return;
+  if (tr.st === 'pending') { tr.st = 'cancelled'; tr.why = 'cancel'; tr.tOut = Date.now(); }
+  else if (tr.st === 'open') paperClose(tr, lastPrice, 'manual', Date.now());
+  savePaper(); renderPaperLines(true); paperUpdate(); renderPanel(true);
+}
+
+// ----- окно «Новая сделка» -----
+let po = null, payShownAt = 0;
+const payEntry = () => po.type === 'limit' && num(po.limit) > 0 ? num(po.limit) : lastPrice;
+function payAtr() { const d = data[po.tf]; if (!d || !d.ind) return NaN; const n = d.candles.length, i = d.candles[n - 1].closed === false ? n - 2 : n - 1; return d.ind.atr[i]; }
+function payAutoStop() {
+  const e = payEntry(), a = payAtr(), s = po.dir === 'long' ? 1 : -1;
+  if (e > 0 && a > 0) po.stop = round2(e - s * (+settings.paperStopAtr || 1) * a);
+}
+function payOpen(pre) {
+  po = Object.assign({ dir: 'long', tf: currentTf, type: 'market', limit: '', lev: Math.min(10, Math.max(1, +settings.paperLev || 3)), margin: +settings.paperMargin || 100, stop: '', target: '', hours: 24, src: 'manual', sig: '' }, pre || {});
+  if (po.type === 'limit' && !(num(po.limit) > 0)) po.type = 'market';
+  if (!(num(po.stop) > 0)) payAutoStop();
+  payShownAt = Date.now();   // защита от «хвоста» тапа по графику только при первом показе окна
+  payDraw();
+}
+function payClose() { $('#payModal').hidden = true; po = null; }
+function payRead() {
+  const g = (id) => $('#' + id);
+  if (g('pLimit')) po.limit = g('pLimit').value;
+  if (g('pHours')) po.hours = num(g('pHours').value) || 0;
+  if (g('pMargin')) po.margin = g('pMargin').value;
+  if (g('pLev')) po.lev = +g('pLev').value;
+  if (g('pStop')) po.stop = g('pStop').value;
+  if (g('pTarget')) po.target = g('pTarget').value;
+  if (g('pTf')) po.tf = g('pTf').value;
+}
+function payDraw() {
+  const m = po, long = m.dir === 'long';
+  $('#payBody').innerHTML = '<h2>Новая сделка <span class="muted small">виртуальная: на биржу не уходит</span></h2>' +
+    '<div class="seg" id="pDir"><button data-v="long" class="' + (long ? 'on sup' : '') + '">ЛОНГ ▲</button><button data-v="short" class="' + (!long ? 'on res' : '') + '">ШОРТ ▼</button></div>' +
+    '<label class="f">ТФ: по нему считаются ATR стопа и условия входа<select id="pTf">' + TFS.map(t => '<option value="' + t.id + '"' + (t.id === m.tf ? ' selected' : '') + '>' + t.label + '</option>').join('') + '</select></label>' +
+    '<label class="f">Вход</label><div class="seg" id="pType"><button data-v="market" class="' + (m.type === 'market' ? 'on' : '') + '">По рынку</button><button data-v="limit" class="' + (m.type === 'limit' ? 'on' : '') + '">Лимитка</button></div>' +
+    (m.type === 'limit' ? '<div class="grid2"><label class="f">Цена лимитки<input id="pLimit" type="number" inputmode="decimal" step="0.01" value="' + m.limit + '"></label>' +
+      '<label class="f">Живёт, часов (0 — пока не отменю)<input id="pHours" type="number" inputmode="decimal" value="' + m.hours + '"></label></div>' : '') +
+    '<div class="grid2"><label class="f">Маржа, $<input id="pMargin" type="number" inputmode="decimal" step="1" value="' + m.margin + '"></label>' +
+    '<label class="f">Плечо: <b id="pLevV">' + m.lev + '×</b><input id="pLev" type="range" min="1" max="10" step="1" value="' + m.lev + '"></label></div>' +
+    '<div class="grid2"><label class="f">Стоп, цена<input id="pStop" type="number" inputmode="decimal" step="0.01" value="' + m.stop + '"></label>' +
+    '<label class="f">Цель, цена (по желанию)<input id="pTarget" type="number" inputmode="decimal" step="0.01" value="' + m.target + '"></label></div>' +
+    '<div class="row" style="margin-top:8px;flex-wrap:wrap"><span class="muted small">Стоп:</span>' + [1, 1.5, 2].map(x => '<button class="btn" data-pq="stop' + x + '" style="padding:4px 8px;white-space:nowrap">' + x + ' ATR</button>').join('') +
+    '<span class="muted small">Цель:</span>' + [1.5, 2, 3].map(x => '<button class="btn" data-pq="rr' + x + '" style="padding:4px 8px;white-space:nowrap">' + x + 'R</button>').join('') + '</div>' +
+    (m.sig ? '<div class="muted small" style="margin-top:6px">Идея: ' + esc(m.sig) + '</div>' : '') +
+    '<div id="pPrev" class="small" style="margin-top:8px"></div>' +
+    '<div class="row" style="margin-top:12px"><button class="btn" id="pCancel">Отмена</button><button class="btn primary" id="pGo" style="flex:1">Открыть сделку</button></div>';
+  $('#payModal').hidden = false; payPrev();
+}
+function payPrev() {
+  const m = po, el = $('#pPrev');
+  if (!el) return;
+  const E = payEntry(), st = num(m.stop), tg = num(m.target), mg = num(m.margin), lev = m.lev, a = payAtr();
+  if (!(E > 0) || !(mg > 0)) { el.innerHTML = ''; return; }
+  const s = m.dir === 'long' ? 1 : -1, notional = mg * lev, qty = notional / E, liq = liqPrice(m.dir, E, lev), fin = feeRate(m.type === 'limit'), fout = feeRate(false);
+  let h = 'Вход ≈ <b>' + fmtP(E) + '</b> · позиция $' + notional.toFixed(0) + ' · ликвидация <b style="color:var(--warn)">' + fmtP(liq) + '</b> (' + (Math.abs(E - liq) / E * 100).toFixed(1) + '% от входа)';
+  if (st > 0) {
+    if (s * (st - E) >= 0) h += '<br><b style="color:var(--down)">Стоп должен быть ' + (s > 0 ? 'ниже' : 'выше') + ' входа</b>';
+    else {
+      const loss = s * (st - E) * qty - notional * fin - st * qty * fout;
+      h += '<br>Стоп ' + fmtP(st) + ' (' + (Math.abs(E - st) / E * 100).toFixed(2) + '%' + (a > 0 ? ', ' + (Math.abs(E - st) / a).toFixed(1) + ' ATR' : '') + '): потеря ≈ <b style="color:var(--down)">' + money(loss) + '</b> (' + (loss / mg * 100).toFixed(0) + '% маржи)';
+      if (s > 0 ? st <= liq : st >= liq) h += '<br><b style="color:var(--warn)">Стоп за ценой ликвидации: раньше сработает ликвидация (минус вся маржа). Уменьшите плечо или приблизьте стоп.</b>';
+    }
+  } else h += '<br><span class="muted">Без стопа: риск — вся маржа (ликвидация).</span>';
+  if (tg > 0) {
+    if (s * (tg - E) <= 0) h += '<br><b style="color:var(--down)">Цель должна быть ' + (s > 0 ? 'выше' : 'ниже') + ' входа</b>';
+    else {
+      const gain = s * (tg - E) * qty - notional * fin - tg * qty * feeRate(true);
+      h += '<br>Цель ' + fmtP(tg) + ': ≈ <b style="color:var(--up)">' + money(gain) + '</b>' + (st > 0 && s * (st - E) < 0 ? ' · R:R 1 : ' + (Math.abs(tg - E) / Math.abs(E - st)).toFixed(2) : '');
+    }
+  }
+  el.innerHTML = h + '<br><span class="muted">Комиссии учтены (рынок ' + settings.paperFeeT + '%, лимитка ' + settings.paperFeeM + '%).</span>';
+}
+function payGo() {
+  payRead();
+  const E = payEntry(), st = num(po.stop), tg = num(po.target), mg = num(po.margin), lim = num(po.limit), s = po.dir === 'long' ? 1 : -1;
+  const bad = (id, msg) => { const e = $('#' + id); if (e) e.style.borderColor = '#ff5b5b'; toast(msg); };
+  if (!(mg > 0)) return bad('pMargin', 'Укажите маржу');
+  if (po.type === 'limit' && !(lim > 0)) return bad('pLimit', 'Укажите цену лимитки');
+  if (st > 0 && s * (st - E) >= 0) return bad('pStop', 'Стоп должен быть ' + (s > 0 ? 'ниже' : 'выше') + ' входа');
+  if (tg > 0 && s * (tg - E) <= 0) return bad('pTarget', 'Цель должна быть ' + (s > 0 ? 'выше' : 'ниже') + ' входа');
+  const o = { dir: po.dir, tf: po.tf, type: po.type, limit: lim, lev: po.lev, margin: mg, stop: st > 0 ? round2(st) : null, target: tg > 0 ? round2(tg) : null, hours: po.hours, src: po.src, sig: po.sig };
+  payClose();
+  paperCreate(o);
+}
+function bindPay() {
+  const M = $('#payModal');
+  M.addEventListener('click', (e) => {
+    if (Date.now() - payShownAt < 450) return;
+    if (e.target.id === 'payModal') { payClose(); return; }
+    const b = e.target.closest('button');
+    if (!b || !po) return;
+    if (b.parentElement.id === 'pDir') { payRead(); po.dir = b.dataset.v; payAutoStop(); po.target = ''; payDraw(); }
+    else if (b.parentElement.id === 'pType') { payRead(); po.type = b.dataset.v; if (po.type === 'limit' && !(num(po.limit) > 0)) po.limit = lastPrice ? round2(lastPrice * (po.dir === 'long' ? 0.995 : 1.005)) : ''; payAutoStop(); payDraw(); }
+    else if (b.id === 'pCancel') payClose();
+    else if (b.id === 'pGo') payGo();
+    else if (b.dataset.pq) {
+      payRead();
+      const E = payEntry(), s = po.dir === 'long' ? 1 : -1;
+      if (b.dataset.pq.indexOf('stop') === 0) { const a = payAtr(); if (a > 0 && E > 0) po.stop = round2(E - s * parseFloat(b.dataset.pq.slice(4)) * a); }
+      else { const st = num(po.stop); if (st > 0 && s * (E - st) > 0) po.target = round2(E + s * parseFloat(b.dataset.pq.slice(2)) * Math.abs(E - st)); else toast('Сначала задайте стоп'); }
+      payDraw();
+    }
+  });
+  M.addEventListener('input', (e) => {
+    if (!po) return;
+    payRead();
+    if (e.target.id === 'pLev') $('#pLevV').textContent = po.lev + '×';
+    payPrev();
+  });
+  M.addEventListener('change', (e) => { if (po && e.target.id === 'pTf') { payRead(); payDraw(); } });
+}
+
+// ----- вкладка «Сделки» -----
+const paperOpened = new Set();           // раскрытые карточки не схлопываем при обновлении панели
+const PAPER_X = [
+  { key: 'typ', label: 'Вход', get: t => t.type, buckets: [['market', 'по рынку'], ['limit', 'лимиткой']] },
+  { key: 'src', label: 'Идея', get: t => t.src, buckets: [['signal', 'сигнал приложения'], ['manual', 'вручную']] },
+  { key: 'lev', label: 'Плечо', get: t => t.lev <= 2 ? 'l' : t.lev <= 5 ? 'm' : 'h', buckets: [['l', '1–2×'], ['m', '3–5×'], ['h', '6–10×']] },
+  { key: 'stp', label: 'Стоп', get: t => { const a = t.cond && t.cond.atr; if (!t.stop0 || !(a > 0)) return 'none'; const x = Math.abs(t.entry - t.stop0) / a; return x < 1 ? 'tight' : x <= 2 ? 'mid' : 'wide'; }, buckets: [['none', 'без стопа'], ['tight', 'тесный (< 1 ATR)'], ['mid', '1–2 ATR'], ['wide', 'широкий (> 2 ATR)']] },
+  { key: 'rr', label: 'Цель', get: t => { if (!t.target || !t.stop0) return 'none'; return Math.abs(t.target - t.entry) / Math.abs(t.entry - t.stop0) >= 1.5 ? 'good' : 'low'; }, buckets: [['none', 'не задана'], ['low', 'R:R меньше 1.5'], ['good', 'R:R от 1.5']] }
+];
+function paperUnreal(t) { return lastPrice == null ? null : pSign(t) * (lastPrice - t.entry) * t.qty - t.feeIn - lastPrice * t.qty * feeRate(false); }
+function condChips(t) {
+  const f = t.cond && t.cond.f;
+  if (!t.cond) return '<div class="muted small">условия не сохранены (данные ТФ не были загружены)</div>';
+  let h = '<span class="chip">K ' + t.cond.k + ' · D ' + t.cond.d + '</span><span class="chip">ATR ' + t.cond.atr + '</span>';
+  if (f && HAS_LEARN) Learn.FACTORS.forEach(F => {
+    if (['ev', 'tf', 'dir'].indexOf(F.key) >= 0 || f[F.key] == null) return;
+    const b = F.buckets.find(x => x[0] === f[F.key]);
+    h += '<span class="chip">' + esc(F.label) + ': ' + esc(b ? b[1] : f[F.key]) + '</span>';
+  });
+  if (t.offAtr != null) h += '<span class="chip">лимитка в ' + t.offAtr + ' ATR от цены</span>';
+  if (t.sigs && t.sigs.length) h += '<div class="small muted" style="margin-top:4px">Сигналы на ТФ в момент входа: ' + esc(t.sigs.join(' · ')) + '</div>';
+  return h;
+}
+const holdTxt = (t) => { const m = Math.round((t.tOut - t.tIn) / 60000); return m < 90 ? m + ' мин' : m < 2880 ? (m / 60).toFixed(1) + ' ч' : (m / 1440).toFixed(1) + ' дн'; };
+function paperCardLive(t) {
+  const L = t.st === 'pending', u = L ? null : paperUnreal(t), c = t.dir;
+  let h = '<div class="card ' + c + '"><div class="top"><span class="badge ' + c + '">' + dirTag(t) + '</span><b>' + TF[t.tf].label + '</b><span class="muted small right">' + (L ? 'лимитка с ' : 'с ') + fmtStamp(L ? t.t0 : t.tIn) + '</span></div>';
+  if (L) h += '<div class="small">⏳ ждёт цену <b>' + fmtP(t.limit) + '</b>' + (t.exp ? ' до ' + fmtStamp(t.exp) : '') + ' · маржа $' + t.margin + '</div>';
+  else h += '<div class="small">вход <b>' + fmtP(t.entry) + '</b> · ликвидация ' + fmtP(t.liq) + ' · маржа $' + t.margin + '</div>' +
+    '<div class="small"><b style="color:var(' + (u >= 0 ? '--up' : '--down') + ')">' + (u == null ? '—' : money(u) + ' (' + (u / t.margin * 100).toFixed(1) + '% маржи)') + '</b> сейчас</div>';
+  h += '<div class="small muted">стоп ' + (t.stop ? fmtP(t.stop) : 'нет') + ' · цель ' + (t.target ? fmtP(t.target) : 'нет') + '</div>' +
+    '<div class="row" style="margin-top:6px;flex-wrap:wrap"><button class="btn" data-act="payStop" data-id="' + t.id + '" style="padding:5px 10px">Стоп</button><button class="btn" data-act="payTgt" data-id="' + t.id + '" style="padding:5px 10px">Цель</button>' +
+    (!L && t.stop !== t.entry ? '<button class="btn" data-act="payBE" data-id="' + t.id + '" style="padding:5px 10px;white-space:nowrap">Безубыток</button>' : '') +
+    '<button class="btn danger" data-act="payClose" data-id="' + t.id + '" style="padding:5px 10px;white-space:nowrap">' + (L ? 'Отменить' : 'Закрыть по рынку') + '</button></div></div>';
+  return h;
+}
+function paperCardDone(t, open) {
+  const w = t.pnl > 0, c = w ? 'long' : 'short';
+  return '<details class="pt" data-pid="' + t.id + '"' + (open || paperOpened.has(t.id) ? ' open' : '') + '><summary><div class="card ' + c + '"><div class="top"><span class="badge ' + c + '">' + dirTag(t) + '</span><b>' + TF[t.tf].label + '</b>' +
+    '<span class="muted small right">' + fmtStamp(t.tOut) + '</span></div><div class="small"><b style="color:var(--' + (w ? 'up' : 'down') + ')">' + money(t.pnl) + ' (' + t.pnlPct.toFixed(1) + '%)</b>' + (t.r != null ? ' · ' + (t.r >= 0 ? '+' : '−') + Math.abs(t.r).toFixed(2) + ' R' : '') + ' · ' + PAPER_WHY[t.why] + '</div></div></summary>' +
+    '<div class="card" style="margin-top:-4px"><div class="small">' + fmtP(t.entry) + ' → ' + fmtP(t.exitP) + ' · держали ' + holdTxt(t) + ' · комиссии $' + t.fees.toFixed(2) + ' · ' + (t.type === 'limit' ? 'лимиткой' : 'по рынку') + ' · ' + (t.src === 'signal' ? 'по сигналу' : 'вручную') + '</div>' +
+    (t.sig ? '<div class="small muted">Идея: ' + esc(t.sig) + '</div>' : '') + '<div style="margin-top:4px">' + condChips(t) + '</div></div></details>';
+}
+// что общего у прибыльных и убыточных: доли условий в двух группах
+function paperInsights(cl) {
+  const W = cl.filter(t => t.pnl > 0), Lz = cl.filter(t => t.pnl <= 0), rows = [], fac = [];
+  if (!W.length || !Lz.length) return rows;
+  if (HAS_LEARN) Learn.FACTORS.filter(F => ['ev', 'tf', 'dir'].indexOf(F.key) < 0).forEach(F => fac.push({ label: F.label, buckets: F.buckets, get: t => t.cond && t.cond.f ? t.cond.f[F.key] : undefined }));
+  PAPER_X.forEach(F => fac.push(F));
+  fac.forEach(F => F.buckets.forEach(([id, lb]) => {
+    const wa = W.filter(t => F.get(t) === id).length, la = Lz.filter(t => F.get(t) === id).length;
+    if (wa + la < 3) return;
+    const pa = wa / W.length, pb = la / Lz.length;
+    rows.push({ label: F.label, b: lb, wa, la, nw: W.length, nl: Lz.length, pa, pb, wr: wa / (wa + la), d: pa - pb });
+  }));
+  return rows.filter(r => Math.abs(r.d) >= 0.2).sort((x, y) => Math.abs(y.d) - Math.abs(x.d)).slice(0, 10);
+}
+const insightLine = (r) => (r.d > 0 ? '+ ' : '− ') + r.label + ': ' + r.b + ' — у прибыльных ' + Math.round(r.pa * 100) + '% (' + r.wa + ' из ' + r.nw + '), у убыточных ' + Math.round(r.pb * 100) + '% (' + r.la + ' из ' + r.nl + '); win в группе ' + Math.round(r.wr * 100) + '% (n=' + (r.wa + r.la) + ')';
+function paperStats(cl) {
+  const n = cl.length, w = cl.filter(t => t.pnl > 0).length, sum = cl.reduce((a, t) => a + t.pnl, 0), rs = cl.filter(t => t.r != null);
+  return { n, w, sum, wr: n ? w / n : null, avg: n ? sum / n : null, avgR: rs.length ? rs.reduce((a, t) => a + t.r, 0) / rs.length : null, nr: rs.length };
+}
+function viewPaper() {
+  const live = paperLive(), cl = paper.filter(t => t.st === 'closed').sort((a, b) => b.tOut - a.tOut), S = paperStats(cl);
+  let h = '<button class="btn primary full" data-act="payNew">⚡ Новая сделка</button>' +
+    '<div class="muted small" style="margin:6px 0">Виртуальные сделки: на биржу ничего не уходит. Исполнение по свечам 15м; если в одной свече и стоп, и цель — считается стоп. Линии стопа и цели можно тянуть в режиме «Правка».</div>';
+  h += '<div class="card"><div class="small">Закрыто: <b>' + S.n + '</b>' + (S.n ? ' · прибыльных <b>' + Math.round(S.wr * 100) + '%</b> (' + S.w + ')' : '') + '</div>' +
+    (S.n ? '<div class="small">Итого <b style="color:var(--' + (S.sum >= 0 ? 'up' : 'down') + ')">' + money(S.sum) + '</b> · в среднем ' + money(S.avg) + ' за сделку' + (S.avgR != null ? ' · средний R ' + (S.avgR >= 0 ? '+' : '−') + Math.abs(S.avgR).toFixed(2) + ' (по ' + S.nr + ')' : '') + '</div>' : '<div class="muted small">Пока нет закрытых сделок.</div>') + '</div>';
+  if (live.length) { h += '<h3>Открытые и ордера</h3>'; live.forEach(t => { h += paperCardLive(t); }); }
+  if (cl.length) {
+    const best = cl.filter(t => t.pnl > 0).sort((a, b) => b.pnl - a.pnl).slice(0, 3), worst = cl.filter(t => t.pnl <= 0).sort((a, b) => a.pnl - b.pnl).slice(0, 2);
+    if (best.length) { h += '<h3>Лучшие сделки и их условия</h3>'; best.forEach(t => { h += paperCardDone(t, true); }); }
+    if (worst.length) { h += '<h3>Худшие</h3>'; worst.forEach(t => { h += paperCardDone(t, false); }); }
+    h += '<h3>Что общего</h3>';
+    const W = cl.filter(t => t.pnl > 0).length, Lz = cl.length - W;
+    if (cl.length < 6 || W < 3 || Lz < 3) h += '<div class="muted small">Нужно хотя бы 6 закрытых сделок: 3 прибыльных и 3 убыточных. Сейчас ' + cl.length + ' (прибыльных ' + W + ').</div>';
+    else {
+      const rows = paperInsights(cl);
+      h += rows.length ? rows.map(r => '<div class="small" style="margin-bottom:4px">' + esc(insightLine(r)) + '</div>').join('') : '<div class="muted small">Заметных различий (от 20 п.п.) между прибыльными и убыточными нет.</div>';
+      h += '<div class="muted small" style="margin-top:6px">' + (cl.length < 50 ? 'Всего ' + cl.length + ' закрытых: это описание, а не вывод. Случайные совпадения при такой выборке обычны; смотрите на условия, которые повторяются на разных сделках, и копите от 50.' : 'Условия зависимы между собой, а групп много: часть различий случайна. Проверяйте на новых сделках.') + '</div>';
+    }
+    h += '<h3>История сделок</h3>';
+    cl.slice(0, 30).forEach(t => { h += paperCardDone(t, false); });
+  }
+  const canc = paper.filter(t => t.st === 'cancelled').length;
+  h += '<h3>Данные для анализа</h3><button class="btn full" data-act="payPrompt">Скопировать сводку для ИИ</button>' +
+    '<div class="row" style="margin-top:8px"><button class="btn" data-act="payJson">Скачать JSON</button>' + (paper.length ? '<button class="btn danger" data-act="payClear">Очистить журнал (' + paper.length + ')</button>' : '') + '</div>' +
+    (canc ? '<div class="muted small" style="margin-top:6px">Отменённых и не сработавших лимиток: ' + canc + '.</div>' : '');
+  return h;
+}
+function paperDigest() {
+  const cl = paper.filter(t => t.st === 'closed').sort((a, b) => b.pnl - a.pnl), S = paperStats(cl), L = [];
+  L.push('Закрыто сделок ' + S.n + ', прибыльных ' + S.w + (S.n ? ' (' + Math.round(S.wr * 100) + '%)' : '') + ', итого ' + money(S.sum) + (S.avgR != null ? ', средний R ' + S.avgR.toFixed(2) + ' (по ' + S.nr + ')' : ''));
+  const line = (t) => '  ' + dirTag(t) + ' ' + TF[t.tf].label + ' ' + fmtP(t.entry) + '→' + fmtP(t.exitP) + ' ' + money(t.pnl) + (t.r != null ? ', R ' + t.r : '') + ', ' + PAPER_WHY[t.why] + ' | ' + (t.cond ? 'K ' + t.cond.k + ', D ' + t.cond.d + ', ATR ' + t.cond.atr : '') + (t.cond && t.cond.f ? ' | ' + Object.keys(t.cond.f).filter(k => ['tf', 'dir'].indexOf(k) < 0).map(k => k + '=' + t.cond.f[k]).join(', ') : '') + (t.sig ? ' | идея: ' + t.sig : '');
+  L.push('Лучшие:'); cl.filter(t => t.pnl > 0).slice(0, 5).forEach(t => L.push(line(t)));
+  L.push('Худшие:'); cl.slice().reverse().filter(t => t.pnl <= 0).slice(0, 5).forEach(t => L.push(line(t)));
+  if (cl.length >= 6) { const rows = paperInsights(cl); if (rows.length) { L.push('Что общего (прибыльные против убыточных):'); rows.forEach(r => L.push('  ' + insightLine(r))); } }
+  return L.join('\n');
+}
+function paperExport() {
+  return { v: 1, kind: 'eth-paper', symbol: 'ETHUSDT', exported: new Date().toISOString(), note: 'виртуальные сделки; исполнение по свечам 15м; стоп и ликвидация важнее цели в одной свече',
+    cfg: { feeTaker: +settings.paperFeeT, feeMaker: +settings.paperFeeM, mmr: PAPER_MMR },
+    factors: HAS_LEARN ? Learn.FACTORS.map(f => ({ key: f.key, label: f.label, values: Object.fromEntries(f.buckets) })) : [],
+    digest: paperDigest(),
+    trades: paper.map(t => ({ id: t.id, st: t.st, dir: t.dir, tf: t.tf, type: t.type, src: t.src, idea: t.sig, lev: t.lev, margin: t.margin, created: new Date(t.t0).toISOString(), opened: t.tIn ? new Date(t.tIn).toISOString() : null,
+      closed: t.tOut ? new Date(t.tOut).toISOString() : null, limit: t.limit, entry: t.entry, exit: t.exitP, stop: t.stop0 || t.stop, target: t.target, liq: t.liq, why: t.why, pnl: t.pnl, pnlPct: t.pnlPct, r: t.r, fees: t.fees,
+      k: t.cond && t.cond.k, d: t.cond && t.cond.d, atr: t.cond && t.cond.atr, f: t.cond && t.cond.f, signals: t.sigs })) };
+}
+function paperCopyPrompt() {
+  const cl = paper.filter(t => t.st === 'closed');
+  if (!cl.length) { toast('Нет закрытых сделок для выгрузки'); return; }
+  const txt = 'Ниже сводка виртуальных сделок приложения «ETH Сигналы» (ETHUSDT): сделки открывались пользователем вручную или по сигналу, с плечом, стопом и целью. ' +
+    'Условия входа посчитаны по последней закрытой свече выбранного ТФ только по данным до входа. Исполнение по свечам 15м, стоп и ликвидация важнее цели в одной свече, комиссии учтены.\n' +
+    (HAS_LEARN ? 'Значения признаков: ' + Learn.FACTORS.filter(f => ['ev', 'tf', 'dir'].indexOf(f.key) < 0).map(f => f.key + ' = ' + f.label + ' (' + f.buckets.map(b => b[0] + ': ' + b[1]).join('; ') + ')').join(' | ') + '\n' : '') +
+    '\n' + paperDigest() + '\n\nЗадачи:\n1. Какие условия повторяются у прибыльных сделок и отсутствуют у убыточных.\n2. Как на результат влияют плечо, тип входа (рынок/лимитка), размер стопа и R:R.\n3. Что нельзя утверждать: мало сделок, зависимые сделки (один рынок, соседние свечи), множественные сравнения.\n\n' +
+    'Ответ: короткий список правил «если …, то …» с числом сделок и долей прибыльных, отдельно что не подтвердилось. Без обещаний прибыли. Если нужны полные записи, скажи, какой срез выгрузить.';
+  const save = () => downloadText('eth-paper-prompt-' + diagFileStamp() + '.txt', txt, 'text/plain;charset=utf-8');
+  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(() => toast('Сводка скопирована: вставьте в чат с ИИ'), save); else save();
+}
+function paperAct(act, el) {
+  const id = el && el.dataset.id, tr = id && paper.find(t => t.id === id);
+  if (act === 'payNew') payOpen();
+  else if (act === 'payFromSig') {
+    const s = activeSignals.find(x => x.stateKey === el.dataset.sk && x.tf === el.dataset.tf);
+    if (!s) { toast('Сигнал уже погас'); return; }
+    const pre = { dir: s.dir, tf: s.tf, src: 'signal', sig: s.text };
+    if (Number.isFinite(s.limitPrice)) { pre.type = 'limit'; pre.limit = round2(s.limitPrice); }
+    if (Number.isFinite(s.stopPrice)) pre.stop = round2(s.stopPrice);
+    if (Number.isFinite(s.exitPrice)) pre.target = round2(s.exitPrice);
+    payOpen(pre);
+  }
+  else if (act === 'payClose') { if (tr && confirm(tr.st === 'pending' ? 'Отменить лимитку?' : 'Закрыть сделку по рынку?')) paperCloseNow(id); }
+  else if (act === 'payStop' || act === 'payTgt') {
+    if (!tr) return;
+    const f = act === 'payStop' ? 'stop' : 'target', v = prompt((f === 'stop' ? 'Стоп' : 'Цель') + ', цена (пусто — убрать):', tr[f] || '');
+    if (v === null) return;
+    paperSetField(tr, f, String(v).trim() === '' ? null : num(v));
+  }
+  else if (act === 'payBE') { if (tr) paperSetField(tr, 'stop', tr.entry); }
+  else if (act === 'payPrompt') paperCopyPrompt();
+  else if (act === 'payJson') downloadText('eth-paper-' + diagFileStamp() + '.json', JSON.stringify(paperExport()), 'application/json');
+  else if (act === 'payClear') { if (confirm('Удалить весь журнал виртуальных сделок (' + paper.length + ')?')) { paper = []; savePaper(); renderPaperLines(true); paperUpdate(); renderPanel(true); } }
 }
 
 // ---------- диагностика: вкладка ----------
@@ -1735,6 +2146,7 @@ function viewLearn() {
 const RULES = {
   rsiLen: [2, 100, 1], stochLen: [2, 100, 1], kLen: [1, 20, 1], dLen: [1, 20, 1], overbought: [50, 99, 0], oversold: [1, 50, 0],
   liqOpacity: [0.1, 1, 0], proxAtr: [0.05, 5, 0], depthAtr: [0.1, 5, 0], guardAtr: [0, 10, 0], sweepWindow: [1, 30, 1], flipAtr: [0, 5, 0], magMax: [0.5, 10, 0], magStop: [0.2, 5, 0], magFar: [3, 100, 0],
+  paperMargin: [1, 1000000, 0], paperLev: [1, 10, 1], paperStopAtr: [0.1, 10, 0], paperFeeT: [0, 1, 0], paperFeeM: [0, 1, 0],
   tgKHi: [50, 99, 0], tgKLo: [1, 50, 0], sqAtr: [1, 20, 0], sqN: [1, 10, 1], sqVol: [1, 20, 0],
   diagTarget: [0.2, 10, 0], diagStop: [0.2, 10, 0], diagHorizon: [1, 48, 1], diagMinN: [5, 200, 1],
   autoWin: [2, 15, 1], autoTol: [0.2, 3, 0], autoMax: [2, 16, 1],
@@ -1769,7 +2181,8 @@ function onSetting(el) {
 }
 
 function onAct(act, el) {
-  if (act === 'tgTest') tgTest();
+  if (act.indexOf('pay') === 0) paperAct(act, el);
+  else if (act === 'tgTest') tgTest();
   else if (act === 'autoUnhide') { autoHidden = []; LS.set('autoHidden', autoHidden); autoSigKey = ''; autoRefresh(true); renderPanel(true); }
   else if (act === 'heatOpen') heatOpen();
   else if (act === 'learnSrc') { settings.learnSrc = el.dataset.v; saveSettings(); learnVersion++; renderPanel(true); }
@@ -2152,6 +2565,9 @@ function bindUI() {
   $('#banner').addEventListener('click', () => setTab('signals'));
   $('#hintCancel').addEventListener('click', () => { const p = placing; setPlacing(null); if (p && ms) drawModal(); });
   $('#btnAdd').addEventListener('click', () => openLevelModal(null));
+  $('#btnTrade').addEventListener('click', () => payOpen());
+  bindPay();
+  $('#panel').addEventListener('toggle', (e) => { const d = e.target; if (d && d.dataset && d.dataset.pid) { if (d.open) paperOpened.add(d.dataset.pid); else paperOpened.delete(d.dataset.pid); } }, true);
   $('#btnEdit').addEventListener('click', (e) => {
     editMode = !editMode;
     e.currentTarget.classList.toggle('on', editMode);
